@@ -1,0 +1,329 @@
+#!/usr/bin/env ruby
+
+require 'net/http'
+
+# Skip checking external links entirely
+skip_external = false
+
+# Safety first! Limit the max number of links to check.
+# Includes external links.  Adjust to taste.
+limit=5000
+
+if ARGV.empty?
+  STDERR.puts "Usage: chklnks 'http://example.com'"
+  exit 1
+end
+
+# Get the start URI from the command line.
+start_uri = URI.parse(ARGV[0])
+start_uri.normalize!
+STDERR.puts "Starting at #{start_uri}..."
+
+# The Link struct stores fAcTz about each unique URI.
+Link = Struct.new(
+  :uri,
+  :from_uris,
+  :to_uri,
+  :check_only,
+  :external,
+  :visited,
+  :result_headers,
+  :result_http_code,
+  :result_ok,
+  :redirected,
+  :redirects_to,
+  :redirect_result_headers,
+  :redirect_result_http_code,
+  :redirect_result_ok,
+  :redirect_redirected
+)
+
+# The links hash stores unique absolute URIs collected as pages
+# are scanned for links.
+@links = {}
+
+# Links are stored in a FIFO queue to be visited. The @links hash
+# above prevents duplicate entries.
+@to_visit = Queue.new
+
+# Add our initial uri to the master link hash. Setting property
+# :check_only to false or else we won't follow the links on the page!
+@links[start_uri.to_s] = Link.new(start_uri, [], start_uri, false)
+
+# Prime the to_visit queue with our start URI.
+@to_visit.push @links[start_uri.to_s]
+
+
+# Returns an absolute URI for the given +to_uri+ URI relative to
+# the +from_uri+.  The +to_uri+ may be relative or absolute.
+# Relative:
+#   from = URI.parse("http://example.com/foo/")
+#   from_to(from, URI.parse("page"))     # http://example.com/foo/page
+#   from_to(from, URI.parse("../bar"))   # http://example.com/bar
+#   from_to(from, URI.parse("/bar"))     # http://example.com/bar
+# Absolute":
+#   from_to(from, URI.parse("http://ruby-doc.org/")) # http://ruby-doc.org/
+def from_to(from_uri, to_uri)
+  to_uri.normalize! # hTtP://eXAMple.com --> http://example.com
+
+  if from_uri.relative?
+    # This should never have happened - the "from" URI should have 
+    # been absolute - this is the page we retrieved from which the
+    # links are coming. How did this happen!?
+    raise BadURIError, "from_to(): from_uri is relative: #{from_uri}"
+  end
+
+  if to_uri.absolute?
+    return to_uri #absolute URI is ready to go!
+  end
+
+  return from_uri.merge(to_uri)
+end
+
+def add_link(from_uri, link_str)
+  to_uri = URI.parse link_str
+  to_uri.fragment = nil # clear any fragment portion
+  to_uri.normalize!
+  
+  absolute_uri = from_to(from_uri, to_uri)
+
+  if @links.key? absolute_uri.to_s
+    # Already in hash. Add the from_uri to the Link
+    @links[absolute_uri.to_s].from_uris.push from_uri
+  else
+    # Create new Link for this Link. Store in hash.
+    @links[absolute_uri.to_s] = Link.new(
+      absolute_uri,      # uri
+      [from_uri],        # array literal with link's first "from"
+      to_uri,            # the semi-unmodified link uri
+      to_uri.absolute?,  # Link.external
+      to_uri.absolute?   # Link.check_only
+    )
+
+    # Hax: don't attempt to extract links from non-page content which has
+    # been linked in an anchor tag.  (In case Content-Type fails us.)
+    if link_str.end_with?(
+        ".jpg", 
+        ".gif", 
+        ".jpeg", 
+        ".pdf", 
+        ".png", 
+        ".svg",
+        ".css")
+      @links[absolute_uri.to_s].check_only = true
+    end
+
+    # Add it to the to_visit queue
+    @to_visit.push @links[absolute_uri.to_s]
+  end
+end
+
+
+# Do The Crawl!
+visited_count = 0
+
+while !@to_visit.empty? and visited_count < limit
+  # Shift off the next queued URI to visit
+  link = @to_visit.shift
+  visited_count += 1
+  truncated_uri = link.uri.to_s.length > 50 ? link.uri.to_s[0..50]+"..." : link.uri.to_s
+  STDERR.puts "#{visited_count} done, #{@to_visit.length} left | #{truncated_uri}"
+
+  if link.external and skip_external
+  STDERR.puts "(Skipping external link!)"
+    next
+  end
+
+  link.visited = true
+
+  ################
+  # HEAD request #
+  ################
+  host = link.uri.hostname
+  port = link.uri.port
+  path = link.uri.path
+  ssl  = link.uri.scheme == 'https'
+  http = Net::HTTP.start( host, port, :use_ssl => ssl )
+  res  = http.request_head(path)
+
+  # Stow the results
+  link.result_headers   = res.each_capitalized.map { |k,v| [k, v] }.to_h
+  link.result_http_code = res.code
+  link.result_ok        = res.instance_of? Net::HTTPOK
+  link.redirected       = res.is_a? Net::HTTPRedirection
+
+  if link.result_headers.key? "Content-Type" and
+     link.result_headers["Content-Type"] != "text/html"
+    link.check_only = true
+  end
+
+  # Handle redirection
+  if link.redirected
+    link.redirects_to = link.result_headers["Location"]
+
+	# Try a single level of redirection (could just add the
+	# link to the queue, but I think it would be a pain to
+	# track the results that way...)
+	redir_result = http.request_head(link.redirects_to)
+    link.redirect_result_headers = redir_result.each_capitalized.map { |k,v| [k, v] }.to_h
+    link.redirect_result_http_code = redir_result.code
+    link.redirect_result_ok        = redir_result.instance_of? Net::HTTPOK
+    link.redirect_redirected       = redir_result.is_a? Net::HTTPRedirection
+  end
+
+  # Continue with a page scan?
+  next if link.check_only or !link.result_ok
+
+  ###############
+  # GET request #    (To scan page for links.)
+  ###############
+  res = Net::HTTP.get_response(link.uri)
+
+  # Scan result body for <a href="sweet links!">...</a>
+  # Note: I _could_ also check for a <base href=""> tag here.
+  res.body.scan(/<a[^>]* href="([^"]+)"/i) do |href|
+    # href[0] because scan nests capture group results [['foo'],['bar']]
+    path = href[0]
+    add_link(link.uri, path)
+  end
+end
+
+if limit <= 0
+  STDERR.puts "*NOTE* Link limit of #{limit} was reached!"
+end
+
+# Counters for stat results
+links_total    = 0
+links_ok       = 0
+links_redirect = 0
+links_other    = 0
+links_internal = 0
+links_external = 0
+
+@links.each do |key, link|
+  # Stat counts
+  links_total += 1
+  links_ok += 1 if link.result_ok
+  links_redirect +=1 if link.redirected
+  links_other += 1 if link.visited and !link.result_ok and !link.redirected
+  links_external += 1 if link.external
+  links_internal += 1 if not link.external
+
+  if link.redirected and !link.redirect_result_ok
+	links_other += 1 # this is also an error
+  end
+end
+
+puts %{<!DOCTYPE html>
+<html><head>
+  <title>chklnks - #{start_uri}</title>
+  <meta charset="utf-8">
+  <style>
+	.link           { border: 1px solid #444; }
+	.link.unvisited { background: #aaa; }
+	.link.redirect  { background: #ffb; }
+	.link.error     { background: #f88; }
+	.link.ok        { background: #8f8; }
+    .tag            { color: #FFF; width: 100px; font-size: small; display: inline-block;
+					  padding: 2px; text-align: center; }
+	.tag.unvisited  { background: #666; }
+	.tag.redirect   { background: #562; }
+	.tag.error      { background: #900; }
+	.tag.ok         { background: #083; }
+	.tag.external   { background: #04B; }
+	.tag.internal   { background: #0B6; }
+	.show_details   { background: #FFF; color: #000; text-decoration: none; }
+  </style>
+</head>
+<body>
+<h1>chklnks - #{start_uri}</h1>
+<table>
+  <tr><td>Total links<td>#{links_total}
+  <tr><td>OK links<td>#{links_ok}
+  <tr><td>Redirected links<td>#{links_redirect}
+  <tr><td>Error links<td>#{links_other}
+  <tr><td>Internal links<td>#{links_internal}
+  <tr><td>External links<td>#{links_external}
+</table>
+}
+
+# Yup, we loop through a second time. Cost: virtually nothing.
+jsid = 0
+@links.each do |key, link|
+  redirect_result_tag = ""
+
+  if not link.visited
+    result_tag="unvisited"
+  elsif link.result_ok
+    result_tag="ok"
+  elsif link.redirected
+    result_tag="redirect"
+    rr = link.redirect_result_ok ? 'ok' : 'error'
+	redirect_result_tag = %{<b class="tag #{rr}">&#10142;#{rr} #{link.redirect_result_http_code}</b>}
+  else
+    result_tag="error"
+  end
+
+  ternal_tag = link.external ? 'external' : 'internal'
+  jsid += 1
+
+  puts %{<div class="link #{result_tag}">
+         <b class="tag #{result_tag}">#{result_tag} #{link.result_http_code}</b>
+         #{redirect_result_tag}
+         <b class="tag #{ternal_tag}">#{ternal_tag}</b>
+         <a href="#" data-jsid="details_#{jsid}" class="show_details">Details&#9660;</a>
+         <a href="#{link.uri}">#{link.uri}</a>
+         <div id="details_#{jsid}" class="details" style="display: none">
+         Linked from:
+         <ul>
+  }
+  link.from_uris.each {|from|
+    puts %{<li><a href="#{from}">#{from}</a></li>}
+  }
+  puts "</ul>"
+
+  if link.visited
+	puts "Headers: <ul>"
+	link.result_headers.each {|k,v|
+	  puts "<li>#{k}: #{v}</li>"
+	}
+	puts "</ul>"
+  else
+	puts "<p><b>Link not visited!</b> (Limit reached or skipping external links?)</p>"
+  end
+
+  # If it's a redirection, nest the results of the redirection here
+  if link.redirected
+    puts %{ <div class="redirect_results">
+              #{redirect_result_tag}
+              <a href="#{link.redirects_to}">#{link.redirects_to}</a><br>}
+	puts "Headers from redirected URI: <ul>"
+	link.redirect_result_headers.each {|k,v|
+	  puts "<li>#{k}: #{v}</li>"
+	}
+	puts "</ul> <!-- end redirect headers list -->"
+	puts "</div> <!-- end redirect nested results -->"
+  end
+
+  puts %{
+	</div> <!-- link details -->
+	</div> <!-- link -->
+  }
+end
+
+puts %{
+<script>
+// Add click handler to toggle visibility of details sections.
+document.querySelectorAll('.show_details').forEach( function(e){
+  e.addEventListener('click', function(event){
+    event.preventDefault();
+    var target = this.dataset.jsid;
+    console.log(target);
+    document.getElementById(target).style.display = 'block';
+  });
+});
+</script>
+Generated by chklnks.rb on #{Time.now}.
+</body>
+</html>
+}
