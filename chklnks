@@ -27,6 +27,7 @@ Link = Struct.new(
   :check_only,
   :external,
   :visited,
+  :connected,
   :result_headers,
   :result_http_code,
   :result_ok,
@@ -143,8 +144,14 @@ while !@to_visit.empty? and visited_count < limit
   port = link.uri.port
   path = link.uri.path
   ssl  = link.uri.scheme == 'https'
-  http = Net::HTTP.start( host, port, :use_ssl => ssl )
+  begin
+    http = Net::HTTP.start( host, port, :use_ssl => ssl )
+  rescue
+    STDERR.puts "* Could not connect to host '#{host}'!"
+    next
+  end
   res  = http.request_head(path)
+  link.connected = true;
 
   # Stow the results
   link.result_headers   = res.each_capitalized.map { |k,v| [k, v] }.to_h
@@ -282,12 +289,14 @@ jsid = 0
   }
   puts "</ul>"
 
-  if link.visited
-	puts "Headers: <ul>"
-	link.result_headers.each {|k,v|
-	  puts "<li>#{k}: #{v}</li>"
-	}
-	puts "</ul>"
+  if link.visited and link.connected
+    puts "Headers: <ul>"
+    link.result_headers.each {|k,v|
+      puts "<li>#{k}: #{v}</li>"
+    }
+    puts "</ul>"
+  elsif link.visited and !link.connected
+    puts "<p><b>Unable to connect to host!</b></p>"
   else
 	puts "<p><b>Link not visited!</b> (Limit reached or skipping external links?)</p>"
   end
