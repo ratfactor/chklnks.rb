@@ -2,15 +2,25 @@
 
 require 'net/http'
 
+# --------------------------------------------------------------
+#                            SETTINGS
+# --------------------------------------------------------------
 # Skip checking external links entirely
 skip_external = false
 
 # Safety first! Limit the max number of links to check.
 # Includes external links.  Adjust to taste.
-limit=5000
+limit = 5000
+
+# How long would you like to wait for a connection and request?
+# (Connection and request will get this timeout *each*, so the
+# theoretical maximum delay could be twice this amount per link.)
+timeout_seconds = 10
+# --------------------------------------------------------------
+# --------------------------------------------------------------
 
 if ARGV.empty?
-  STDERR.puts "Usage: chklnks 'http://example.com'"
+  STDERR.puts "Usage: chklnks 'http://example.com' ['/no-follow1/ /no-follow2/']"
   exit 1
 end
 
@@ -19,6 +29,14 @@ start_uri = URI.parse(ARGV[0])
 start_uri.normalize!
 STDERR.puts "Starting at #{start_uri}..."
 
+$no_follows = nil
+
+if ARGV[1]
+  $no_follows = ARGV[1].split
+end
+
+start_uri = URI.parse(ARGV[0])
+
 # The Link struct stores fAcTz about each unique URI.
 Link = Struct.new(
   :uri,
@@ -26,6 +44,7 @@ Link = Struct.new(
   :to_uri,
   :check_only,
   :external,
+  :yuck_invalid_link,
   :visited,
   :connected,
   :result_headers,
@@ -49,7 +68,13 @@ Link = Struct.new(
 
 # Add our initial uri to the master link hash. Setting property
 # :check_only to false or else we won't follow the links on the page!
-@links[start_uri.to_s] = Link.new(start_uri, [], start_uri, false)
+@links[start_uri.to_s] = Link.new(
+  start_uri, # uri
+  [],        # from_uris
+  start_uri, # to_uri
+  false,     # check_only
+  false      # external
+)
 
 # Prime the to_visit queue with our start URI.
 @to_visit.push @links[start_uri.to_s]
@@ -82,7 +107,21 @@ def from_to(from_uri, to_uri)
 end
 
 def add_link(from_uri, link_str)
-  to_uri = URI.parse link_str
+  begin
+    to_uri = URI.parse link_str
+  rescue
+    # parse failed, so the href must have been malformed
+    @links[to_uri] = Link.new(
+      nil,        # Link.uri
+      [from_uri], # Link.from_uris
+      nil,        # Link.to_uri
+      nil,        # Link.check_only
+      nil,        # Link.external
+      link_str    # Link.yuck_invalid_link
+    )
+    return
+  end
+
   to_uri.fragment = nil # clear any fragment portion
   to_uri.normalize!
   
@@ -97,9 +136,18 @@ def add_link(from_uri, link_str)
       absolute_uri,      # uri
       [from_uri],        # array literal with link's first "from"
       to_uri,            # the semi-unmodified link uri
-      to_uri.absolute?,  # Link.external
-      to_uri.absolute?   # Link.check_only
+      to_uri.absolute?,  # Link.check_only
+      to_uri.absolute?   # Link.external
     )
+
+    # Set to check_only if a no_follows pattern matches
+    if $no_follows
+      $no_follows.each do |nf|
+        if absolute_uri.to_s.include?(nf)
+          @links[absolute_uri.to_s].check_only = true
+        end
+      end
+    end
 
     # Hax: don't attempt to extract links from non-page content which has
     # been linked in an anchor tag.  (In case Content-Type fails us.)
@@ -131,7 +179,12 @@ while !@to_visit.empty? and visited_count < limit
   STDERR.puts "#{visited_count} done, #{@to_visit.length} left | #{truncated_uri}"
 
   if link.external and skip_external
-  STDERR.puts "(Skipping external link!)"
+    STDERR.puts "(Skipping external link!)"
+    next
+  end
+
+  if link.yuck_invalid_link
+    STDERR.puts "(Skipping invalid URI!)"
     next
   end
 
@@ -145,12 +198,24 @@ while !@to_visit.empty? and visited_count < limit
   path = link.uri.path
   ssl  = link.uri.scheme == 'https'
   begin
-    http = Net::HTTP.start( host, port, :use_ssl => ssl )
+    http = Net::HTTP.start( host, port, {
+             :use_ssl => ssl,
+             :read_timeout => timeout_seconds,
+             :open_timeout => timeout_seconds
+           })
   rescue
     STDERR.puts "* Could not connect to host '#{host}'!"
     next
   end
-  res  = http.request_head(path)
+  begin
+    res  = http.request_head(path)
+  rescue Net::ReadTimeout
+    STDERR.puts "* Connected to '#{host}', but HEAD timed out."
+    next
+  rescue
+    STDERR.puts "* Error while performing HEAD request: #{$!}"
+    next
+  end
   link.connected = true;
 
   # Stow the results
@@ -226,16 +291,19 @@ puts %{<!DOCTYPE html>
   <title>chklnks - #{start_uri}</title>
   <meta charset="utf-8">
   <style>
+    code            { background: #fff; padding: 5px; }
 	.link           { border: 1px solid #444; }
 	.link.unvisited { background: #aaa; }
 	.link.redirect  { background: #ffb; }
 	.link.error     { background: #f88; }
+	.link.bad-uri   { background: #aaa; }
 	.link.ok        { background: #8f8; }
     .tag            { color: #FFF; width: 100px; font-size: small; display: inline-block;
 					  padding: 2px; text-align: center; }
 	.tag.unvisited  { background: #666; }
 	.tag.redirect   { background: #562; }
 	.tag.error      { background: #900; }
+	.tag.bad-uri    { background: #900; }
 	.tag.ok         { background: #083; }
 	.tag.external   { background: #04B; }
 	.tag.internal   { background: #0B6; }
@@ -259,7 +327,10 @@ jsid = 0
 @links.each do |key, link|
   redirect_result_tag = ""
 
-  if not link.visited
+  if link.yuck_invalid_link
+    result_tag="bad-uri"
+    link.uri = link.yuck_invalid_link
+  elsif not link.visited
     result_tag="unvisited"
   elsif link.result_ok
     result_tag="ok"
@@ -289,6 +360,10 @@ jsid = 0
   }
   puts "</ul>"
 
+  if link.yuck_invalid_link
+    puts "Unable to parse this href: <code>#{link.yuck_invalid_link}</code>"
+  end
+
   if link.visited and link.connected
     puts "Headers: <ul>"
     link.result_headers.each {|k,v|
@@ -298,7 +373,7 @@ jsid = 0
   elsif link.visited and !link.connected
     puts "<p><b>Unable to connect to host!</b></p>"
   else
-	puts "<p><b>Link not visited!</b> (Limit reached or skipping external links?)</p>"
+	puts "<p><b>Link not visited!</b></p>"
   end
 
   # If it's a redirection, nest the results of the redirection here
