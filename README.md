@@ -1,4 +1,9 @@
 # chklnks.rb
+
+
+**MOVED!** Hello, I am moving my repos to http://ratfactor.com/repos/
+and setting them to read-only ("archived") on GitHub. Thank you, _-Dave_
+
 Website link crawler and checker written in Ruby.
 
 * Around 250 lines of Ruby
